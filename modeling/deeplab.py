@@ -29,6 +29,7 @@ class DeepLab(nn.Module):
         x = self.aspp(x)
         x = self.decoder(x, low_level_feat)
         x = F.interpolate(x, size=input.size()[2:], mode='bilinear', align_corners=True)
+        # x = F.interpolate(x, size=(720,1280), mode='nearest')
 
         return x
 

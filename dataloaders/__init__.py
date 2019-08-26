@@ -1,4 +1,4 @@
-from dataloaders.datasets import cityscapes, coco, combine_dbs, pascal, sbd
+from dataloaders.datasets import cityscapes, coco, combine_dbs, pascal, sbd, arbel
 from torch.utils.data import DataLoader
 
 def make_data_loader(args, **kwargs):
@@ -34,6 +34,15 @@ def make_data_loader(args, **kwargs):
         num_class = train_set.NUM_CLASSES
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **kwargs)
         val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, **kwargs)
+        test_loader = None
+        return train_loader, val_loader, test_loader, num_class
+
+    elif args.dataset == 'arbel':
+        train_set = arbel.ArbelSegmentation(args, split='train')
+        val_set = arbel.ArbelSegmentation(args, split='val')
+        num_class = train_set.NUM_CLASSES
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **kwargs)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, drop_last=True,  **kwargs)
         test_loader = None
         return train_loader, val_loader, test_loader, num_class
 

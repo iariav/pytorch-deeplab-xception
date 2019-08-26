@@ -13,6 +13,13 @@ from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
+import apex
+from apex.fp16_utils import FP16_Optimizer
+try:
+    from apex import amp
+    APEX_AVAILABLE = True
+except ModuleNotFoundError:
+    APEX_AVAILABLE = False
 
 class Trainer(object):
     def __init__(self, args):
@@ -24,6 +31,7 @@ class Trainer(object):
         # Define Tensorboard Summary
         self.summary = TensorboardSummary(self.saver.experiment_dir)
         self.writer = self.summary.create_summary()
+        self.use_amp = True if APEX_AVAILABLE else False
         
         # Define Dataloader
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
@@ -40,8 +48,10 @@ class Trainer(object):
                         {'params': model.get_10x_lr_params(), 'lr': args.lr * 10}]
 
         # Define Optimizer
-        optimizer = torch.optim.SGD(train_params, momentum=args.momentum,
-                                    weight_decay=args.weight_decay, nesterov=args.nesterov)
+        # optimizer = torch.optim.SGD(train_params, momentum=args.momentum,
+        #                             weight_decay=args.weight_decay, nesterov=args.nesterov)
+
+        optimizer = torch.optim.AdamW(train_params, weight_decay=args.weight_decay)
 
         # Define Criterion
         # whether to use class balanced weights
@@ -55,20 +65,33 @@ class Trainer(object):
         else:
             weight = None
         self.criterion = SegmentationLosses(weight=weight, cuda=args.cuda).build_loss(mode=args.loss_type)
+
         self.model, self.optimizer = model, optimizer
         
         # Define Evaluator
         self.evaluator = Evaluator(self.nclass)
         # Define lr scheduler
         self.scheduler = LR_Scheduler(args.lr_scheduler, args.lr,
-                                            args.epochs, len(self.train_loader))
+                                            args.epochs, len(self.train_loader),lr_step=100)
 
         # Using cuda
         if args.cuda:
-            self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
-            patch_replication_callback(self.model)
             self.model = self.model.cuda()
 
+        # mixed precision
+        if self.use_amp and args.cuda:
+            self.model, self.optimizer = amp.initialize(
+                self.model, self.optimizer, opt_level="O2",
+                keep_batchnorm_fp32=True, loss_scale="dynamic"
+            )
+
+        # Using data parallel
+        if args.cuda:
+            self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
+            patch_replication_callback(self.model)
+            # self.model = apex.parallel.DistributedDataParallel(self.model)
+
+        # self.optimizer = FP16_Optimizer(self.optimizer,dynamic_loss_scale=True)
         # Resuming checkpoint
         self.best_pred = 0.0
         if args.resume is not None:
@@ -103,7 +126,12 @@ class Trainer(object):
             self.optimizer.zero_grad()
             output = self.model(image)
             loss = self.criterion(output, target)
-            loss.backward()
+            if self.use_amp:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
             self.optimizer.step()
             train_loss += loss.item()
             tbar.set_description('Train loss: %.3f' % (train_loss / (i + 1)))
@@ -118,15 +146,15 @@ class Trainer(object):
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print('Loss: %.3f' % train_loss)
 
-        if self.args.no_val:
+        # if self.args.no_val:
             # save checkpoint every epoch
-            is_best = False
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
+        is_best = False
+        self.saver.save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': self.model.module.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'best_pred': self.best_pred,
+        }, is_best, filename='checkpoint_fp16_02_os8.pth')
 
 
     def validation(self, epoch):
@@ -183,7 +211,7 @@ def main():
     parser.add_argument('--out-stride', type=int, default=16,
                         help='network output stride (default: 8)')
     parser.add_argument('--dataset', type=str, default='pascal',
-                        choices=['pascal', 'coco', 'cityscapes'],
+                        choices=['pascal', 'coco', 'cityscapes', 'arbel'],
                         help='dataset name (default: pascal)')
     parser.add_argument('--use-sbd', action='store_true', default=True,
                         help='whether to use SBD dataset (default: True)')
@@ -214,6 +242,7 @@ def main():
     parser.add_argument('--use-balanced-weights', action='store_true', default=False,
                         help='whether to use balanced weights (default: False)')
     # optimizer params
+
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (default: auto)')
     parser.add_argument('--lr-scheduler', type=str, default='poly',
@@ -225,6 +254,8 @@ def main():
                         metavar='M', help='w-decay (default: 5e-4)')
     parser.add_argument('--nesterov', action='store_true', default=False,
                         help='whether use nesterov (default: False)')
+    parser.add_argument('--use_balanced_weights', action='store_true', default=False,
+                        help='whether to use balanced weights for training (default: False)')
     # cuda, seed and logging
     parser.add_argument('--no-cuda', action='store_true', default=
                         False, help='disables CUDA training')

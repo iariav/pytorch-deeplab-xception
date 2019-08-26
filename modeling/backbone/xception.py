@@ -43,6 +43,8 @@ class Block(nn.Module):
             self.skip = None
 
         self.relu = nn.ReLU(inplace=True)
+        # self.prune_filters = []
+
         rep = []
 
         filters = inplanes
@@ -86,6 +88,8 @@ class Block(nn.Module):
         else:
             skip = inp
 
+        x_shape = x.shape
+        skip_shape = skip.shape
         x = x + skip
 
         return x

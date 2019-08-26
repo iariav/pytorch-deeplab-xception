@@ -27,6 +27,9 @@ def decode_segmap(label_mask, dataset, plot=False):
     elif dataset == 'cityscapes':
         n_classes = 19
         label_colours = get_cityscapes_labels()
+    elif dataset == 'arbel':
+        n_classes = 19
+        label_colours = get_arbel_labels()
     else:
         raise NotImplementedError
 
@@ -87,6 +90,29 @@ def get_cityscapes_labels():
         [0, 0, 230],
         [119, 11, 32]])
 
+def get_arbel_labels():
+
+    return np.array(
+           [[149,129,107], # Terrain
+           [198,186,173], # Terrain route
+           [77,69,59],    # Terrain route - Metal palette
+           [144,100,0],   # Tree - trunk
+           [103,128,88],  # Tree - leaf
+           [128,0,255], # Rocks
+           [158,217,92],  # Large Shrubs
+           [200,217,92],  # Low Vegetation
+           [217,158,93],  # Wire Fance
+           [0,0,128],     # background(sky)
+           [160,5,5],     # Person
+           [53,133,193],  # Vehicle
+           [0,0,0],       # building
+           [30,30,30],    # paved road
+           [255,255,255], # Misc.
+           [0, 255, 255],  # empty
+           [0, 255, 255],  # empty
+           [0, 255, 255],  # empty
+           [0, 255, 255],  # empty
+           ])
 
 def get_pascal_labels():
     """Load the mapping that associates pascal classes with label colors
