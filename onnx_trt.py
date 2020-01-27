@@ -25,12 +25,12 @@ def LoadImage(image_path,target_size):
 
 if __name__ == '__main__':
 
-    dummy_input = torch.randn(1, 3, 720, 1280, device='cuda')
+    dummy_input = torch.randn(4, 3, 720, 1280, device='cuda')
     img_size = dummy_input.size()
     save_txt = False
     save_images = False
     load_engine = False
-    precision = 'int8'  # 'fp16' \ 'fp32' \ 'int8'
+    precision = 'fp16'  # 'fp16' \ 'fp32' \ 'int8'
 
     INPUT_SIZE_HEIGHT = 720
     INPUT_SIZE_WIDTH = 1280  # was 1280
@@ -77,10 +77,10 @@ if __name__ == '__main__':
 
     # load model
 
-    model = onnx.load("deeplab_nearest.onnx")
-    engine_path = 'deeplab_' + precision + '.engine'
+    model = onnx.load("deeplab_pruned.onnx")
+    engine_path = 'deeplab_pruned_' + precision + '.engine'
 
-    engine = backend.prepare(model, device='CUDA:0',serialize_engine=False,precision=precision,max_batch_size=1, load_engine=load_engine,engine_path=engine_path)
+    engine = backend.prepare(model, device='CUDA:0',serialize_engine=False,precision=precision,max_batch_size=4, load_engine=load_engine,engine_path=engine_path)
 
 
     def list_images(folder, pattern='*', ext='bmp'):
@@ -132,7 +132,7 @@ if __name__ == '__main__':
         # Get detections
         img = LoadImage(image_path,target_size)
 
-
+        img = np.concatenate((img, img, img, img), axis=0)
         output_data = engine.run(img)[0]
 
         # post pocessing

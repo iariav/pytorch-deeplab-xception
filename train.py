@@ -13,13 +13,111 @@ from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
-import apex
-from apex.fp16_utils import FP16_Optimizer
+from finetune import FilterPrunner
+from prune import prune_xception_layer
+from torch.autograd import Variable
+import time
+
 try:
     from apex import amp
     APEX_AVAILABLE = True
 except ModuleNotFoundError:
     APEX_AVAILABLE = False
+
+class PrunningFineTuner_DEEPLAB:
+    def __init__(self, train_data_loader, use_cuda , model, optimizer):
+
+        self.train_data_loader = train_data_loader
+        self.model = model
+        # self.optimizer = optimizer
+        self.prunner = FilterPrunner(self.model,use_cuda)
+        self.model.train()
+        self.criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
+        self.use_cuda = use_cuda
+        self.number_of_filters = self.total_num_filters()
+
+    def train_epoch(self):
+
+        for i, sample in enumerate(self.train_data_loader):
+            if i % 100 == 0:
+                print('Processing batch {}/{}'.format(i,int(len(self.train_data_loader))))
+            # if i > 20:
+            #     break
+            input, label = sample['image'], sample['label']
+
+            if self.use_cuda:
+                input = input.cuda()
+                label = label.cuda()
+
+            self.model.zero_grad()
+            # input = Variable(batch)
+
+            output = self.prunner.forward(input)
+            loss = self.criterion(output, label.long())
+            loss.backward()
+
+    def get_candidates_to_prune(self, num_filters_to_prune):
+        self.prunner.reset()
+        self.train_epoch()
+        self.prunner.normalize_ranks_per_layer()
+        return self.prunner.get_prunning_plan(num_filters_to_prune)
+
+    def total_num_filters(self):
+
+        filters = 0
+
+        def count_conv_layers(network,filters=0):
+
+            for layer in network.children():
+                # print(type(layer))
+                if isinstance(layer, torch.nn.modules.conv.Conv2d):
+                    filters = filters + layer.out_channels
+                elif 'Block' in str(type(layer)):  # if sequential layer, apply recursively to layers in sequential layer
+                    filters += count_conv_layers(layer)
+                elif 'SeparableConv2d' in str(type(layer)):  # if sequential layer, apply recursively to layers in sequential layer
+                    filters += count_conv_layers(layer)
+                elif type(layer) == nn.Sequential:
+                    filters += count_conv_layers(layer)
+
+            return filters
+
+        return count_conv_layers(self.model.backbone,filters)
+
+    def prune(self,num_filters_to_prune_per_iteration, model):
+
+        self.model = model
+        self.model.train()
+
+        print("Ranking filters.. ")
+        prune_targets = self.get_candidates_to_prune(num_filters_to_prune_per_iteration)
+        layers_prunned = {}
+        for layer_index, filter_index in prune_targets:
+            if layer_index not in layers_prunned:
+                layers_prunned[layer_index] = 0
+            layers_prunned[layer_index] = layers_prunned[layer_index] + 1
+
+        print("Layers that will be prunned", layers_prunned)
+        print("Prunning filters.. ")
+        model = self.model.cpu()
+        for i, (layer_index, filter_index) in enumerate(prune_targets):
+            # print('[{}] - Pruning layer {} and filter_index {}'.format(i,layer_index,filter_index))
+            model, update_pruned_layers = prune_xception_layer(model, layer_index, filter_index, self.prunner.flat_backbone, self.prunner.model_dict)
+
+            # fix filters' indices
+            for l, (l_index, f_index) in enumerate(prune_targets):
+                if l_index in update_pruned_layers and f_index >= filter_index:
+                    prune_targets[l] = (l_index, f_index-1)
+
+
+        self.model = model
+        if self.use_cuda:
+            self.model = self.model.cuda()
+
+        message = str(100 * float(self.total_num_filters()) / self.number_of_filters) + "%"
+        print("Filters prunned", str(message))
+
+        return self.model
+
 
 class Trainer(object):
     def __init__(self, args):
@@ -31,7 +129,7 @@ class Trainer(object):
         # Define Tensorboard Summary
         self.summary = TensorboardSummary(self.saver.experiment_dir)
         self.writer = self.summary.create_summary()
-        self.use_amp = True if APEX_AVAILABLE else False
+        self.use_amp = True if APEX_AVAILABLE and not args.prune else False
         
         # Define Dataloader
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
@@ -48,10 +146,10 @@ class Trainer(object):
                         {'params': model.get_10x_lr_params(), 'lr': args.lr * 10}]
 
         # Define Optimizer
-        # optimizer = torch.optim.SGD(train_params, momentum=args.momentum,
-        #                             weight_decay=args.weight_decay, nesterov=args.nesterov)
+        optimizer = torch.optim.SGD(train_params, momentum=args.momentum,
+                                    weight_decay=args.weight_decay, nesterov=args.nesterov)
 
-        optimizer = torch.optim.AdamW(train_params, weight_decay=args.weight_decay)
+        # optimizer = torch.optim.AdamW(train_params, weight_decay=args.weight_decay)
 
         # Define Criterion
         # whether to use class balanced weights
@@ -144,7 +242,7 @@ class Trainer(object):
 
         self.writer.add_scalar('train/total_loss_epoch', train_loss, epoch)
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
-        print('Loss: %.3f' % train_loss)
+        print('Loss: %.3f' % (train_loss/len(self.train_loader)))
 
         # if self.args.no_val:
             # save checkpoint every epoch
@@ -162,12 +260,15 @@ class Trainer(object):
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc='\r')
         test_loss = 0.0
+
         for i, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
             if self.args.cuda:
                 image, target = image.cuda(), target.cuda()
+
             with torch.no_grad():
                 output = self.model(image)
+
             loss = self.criterion(output, target)
             test_loss += loss.item()
             tbar.set_description('Test loss: %.3f' % (test_loss / (i + 1)))
@@ -188,9 +289,9 @@ class Trainer(object):
         self.writer.add_scalar('val/Acc_class', Acc_class, epoch)
         self.writer.add_scalar('val/fwIoU', FWIoU, epoch)
         print('Validation:')
-        print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
+        print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.test_batch_size + image.data.shape[0]))
         print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {}".format(Acc, Acc_class, mIoU, FWIoU))
-        print('Loss: %.3f' % test_loss)
+        print('Loss: %.3f' % (test_loss/len(self.val_loader)))
 
         new_pred = mIoU
         if new_pred > self.best_pred:
@@ -202,6 +303,7 @@ class Trainer(object):
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
+
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch DeeplabV3Plus Training")
@@ -215,7 +317,7 @@ def main():
                         help='dataset name (default: pascal)')
     parser.add_argument('--use-sbd', action='store_true', default=True,
                         help='whether to use SBD dataset (default: True)')
-    parser.add_argument('--workers', type=int, default=4,
+    parser.add_argument('--workers', type=int, default=0,
                         metavar='N', help='dataloader threads')
     parser.add_argument('--base-size', type=int, default=513,
                         help='base image size')
@@ -277,6 +379,8 @@ def main():
                         help='evaluuation interval (default: 1)')
     parser.add_argument('--no-val', action='store_true', default=False,
                         help='skip validation during training')
+    parser.add_argument('--prune', action='store_true', default=False,
+                        help='perform pruning iterations')
 
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -323,10 +427,55 @@ def main():
     trainer = Trainer(args)
     print('Starting Epoch:', trainer.args.start_epoch)
     print('Total Epoches:', trainer.args.epochs)
-    for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
-        trainer.training(epoch)
-        if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
-            trainer.validation(epoch)
+
+    if args.prune:
+
+        fine_tuner = PrunningFineTuner_DEEPLAB(trainer.train_loader, args.cuda, trainer.model.module,trainer.optimizer)
+
+        # Make sure all the layers are trainable
+        for param in fine_tuner.model.backbone.parameters():
+            param.requires_grad = True
+
+        number_of_filters = fine_tuner.total_num_filters()
+        num_filters_to_prune_per_iteration = 256
+        iterations = int(float(number_of_filters) / num_filters_to_prune_per_iteration)
+
+        iterations = int(iterations * 2.0 / 4)
+
+        print("Number of prunning iterations to reduce 50% filters", iterations)
+
+        t0 = time.time()
+        trainer.validation(0)
+        infer_time = time.time() - t0
+        print("Time of validation of original model is {} seconds.".format(infer_time))
+
+        for n in range(iterations):
+
+            trainer.model.module = fine_tuner.prune(num_filters_to_prune_per_iteration,trainer.model.module)
+            print("Fine tuning to recover from prunning iteration.")
+            for epoch in range(10):
+                trainer.training(epoch)
+
+            t0 = time.time()
+            trainer.validation(0)
+            infer_time = time.time() - t0
+            print("Time of validation after pruning iteration {} is {} seconds.".format(n,infer_time))
+            torch.save(trainer.model.module, "/home/ido/Deep/Pytorch/pytorch-deeplab-xception/pruned_models/iter_{}_time_{}.pth".format(n,infer_time))
+
+        print("Finished. Going to fine tune the model a bit more")
+        for epoch in range(15):
+            trainer.training(epoch)
+
+        t0 = time.time()
+        trainer.validation(0)
+        infer_time = time.time() - t0
+        print("Time of validation of final prunned model is {} seconds.".format(infer_time))
+        torch.save(model.state_dict(), "model_prunned")
+    else:
+        for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
+            # trainer.training(epoch)
+            if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
+                trainer.validation(epoch)
 
     trainer.writer.close()
 

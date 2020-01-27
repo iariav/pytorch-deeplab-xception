@@ -1,15 +1,7 @@
 import torch
 from torch.autograd import Variable
 from torchvision import models
-import cv2
-import sys
 import numpy as np
- 
-def replace_layers(model, i, indexes, layers):
-    if i in indexes:
-        return layers[indexes.index(i)]
-    return model[i]
-
 
 def prune_xception_bn_layer(old_bn, filter_index):
 
@@ -109,10 +101,8 @@ def update_original_model(model,layer,model_layer):
         elif 'skip' in model_layer:
             model.backbone._modules[block].skip = layer
         else:
-
             module = names[4][-2:-1]
             model.backbone._modules[block].rep._modules[module] = layer
-
     else:
         if 'SeparableConv2d' in str(layer):
             names = model_layer.split(".")
@@ -131,34 +121,35 @@ def update_original_model(model,layer,model_layer):
 
     return model
 
-def do_prune_skip(model_layer, model):
-
-    prune = False
-    final_conv = False
-
-    if 'block' in model_layer:
-        names = model_layer.split(".")
-        block = names[2]
-        module = names[4][-2:-1]
-        layer = names[-1]
-
-        if module == '0' and layer == 'conv1':
-            prune = True
-            final_conv = True
-        elif module == str(len(model.backbone._modules[block].rep._modules)-1):
-            prune = True
-
-
-    return prune, final_conv
+# def do_prune_skip(model_layer, model):
+#
+#     prune = False
+#     final_conv = False
+#
+#     if 'block' in model_layer:
+#         names = model_layer.split(".")
+#         block = names[2]
+#         module = names[4][-2:-1]
+#         layer = names[-1]
+#
+#         if module == '0' and layer == 'conv1':
+#             prune = True
+#             final_conv = True
+#         elif module == str(len(model.backbone._modules[block].rep._modules)-1):
+#             prune = True
+#
+#
+#     return prune, final_conv
 
 def prune_xception_layer(model, layer_index, filter_index, flat_backbone, model_dict):
 
-    # layer_index = 58 #166,211,223,256,226,191,51,206,278,73,181,273,253
+    # layer_index = 58
 
+    debug = False
     old_conv = flat_backbone[layer_index]
     final_conv_idx = None
     first_conv_idx = None
-    prune_skip = False
+    # prune_skip = False
     offset = 1
     pruned_layers = []
 
@@ -193,14 +184,16 @@ def prune_xception_layer(model, layer_index, filter_index, flat_backbone, model_
             module = names[4][-2:-1]
             layer = names[-1]
             if (module == '0' and layer == 'conv1') or module == str(len(model.backbone._modules[block].rep._modules) - 1):
-                print('skip prunning since it requires changing the block\'s input\output sizes')
+                if debug:
+                    print('skip prunning since it requires changing the block\'s input\output sizes')
                 return model, pruned_layers
 
     for i in range (first_conv_idx,final_conv_idx+1):
         layer = flat_backbone[i]
         model_layer = model_dict[i]
 
-        print('     pruned layer: {}'.format(model_layer))
+        if debug:
+            print('     pruned layer: {}'.format(model_layer))
         if isinstance(layer, torch.nn.modules.conv.Conv2d):
             flat_backbone[i] = prune_xception_conv_layer(layer, filter_index,final_conv = (i==final_conv_idx))
             model = update_original_model(model,flat_backbone[i],model_layer)

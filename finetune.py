@@ -366,7 +366,7 @@ class FilterPrunner:
         activation_index = len(self.activations) - self.grad_index - 1
         activation = self.activations[activation_index]
 
-        taylor = activation * grad
+        taylor = activation.float() * grad.float()
         # Get the average value for every filter, 
         # accross all the other dimensions
         taylor = taylor.mean(dim=(0, 2, 3)).data
@@ -439,10 +439,13 @@ class PrunningFineTuner_DEEPLAB:
         print('Testing model:')
         self.model.eval()
         self.evaluator.reset()
-        correct = 0
-        total = 0
+        mean_infer_time = []
+
 
         for i, sample in enumerate(self.test_data_loader):
+            if i % 50 == 0:
+                print('Processing batch {}/{}'.format(i,int(len(self.test_data_loader))))
+            t0 = time.time()
             batch, target = sample['image'], sample['label']
             if self.use_cuda:
                 batch = batch.cuda()
@@ -451,30 +454,36 @@ class PrunningFineTuner_DEEPLAB:
             pred = output.data.cpu().numpy()
             target = target.cpu().numpy()
             pred = np.argmax(pred, axis=1)
+            t_total = (time.time() - t0)
             # Add batch sample into evaluator
             self.evaluator.add_batch(target, pred)
+            mean_infer_time.append(t_total)
+
+        m_time = np.mean(mean_infer_time)
+        print("Mean inference after pruning took {} ms per epoch.".format(m_time*1000))
 
         Acc = self.evaluator.Pixel_Accuracy()
         Acc_class = self.evaluator.Pixel_Accuracy_Class()
         mIoU = self.evaluator.Mean_Intersection_over_Union()
         FWIoU = self.evaluator.Frequency_Weighted_Intersection_over_Union()
-        print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {}".format(Acc, Acc_class, mIoU, FWIoU))
+        print("Acc:{0:.3f}, Acc_class:{1:.3f}, mIoU:{2:.3f}, fwIoU: {3:.3f}".format(Acc*100, Acc_class*100, mIoU*100, FWIoU*100))
 
         self.model.train()
+
+        return m_time, Acc, Acc_class, mIoU, FWIoU
 
     def train(self, optimizer=None, epoches=10):
         if optimizer is None:
             optimizer = optim.SGD(self.model.classifier.parameters(), lr=0.0001, momentum=0.9)
 
-        t0 = time.time()
+
         for i in range(epoches):
             print("Epoch: ", i)
             self.train_epoch(optimizer)
-            self.test()
+            # self.test()
         print("Finished fine tuning.")
-        t_total = (time.time() - t0) / epoches
-        print("Retraining time after pruning took {} seconds per epoch.".format(t_total))
-        return t_total
+
+        return self.test()
 
     def train_batch(self, optimizer, batch, label, rank_filters):
 
@@ -553,7 +562,7 @@ class PrunningFineTuner_DEEPLAB:
             param.requires_grad = True
 
         number_of_filters = self.total_num_filters()
-        num_filters_to_prune_per_iteration = 128
+        num_filters_to_prune_per_iteration = 256
         iterations = int(float(number_of_filters) / num_filters_to_prune_per_iteration)
 
         iterations = int(iterations * 2.0 / 4)
@@ -572,13 +581,21 @@ class PrunningFineTuner_DEEPLAB:
             print("Layers that will be prunned", layers_prunned)
             print("Prunning filters.. ")
             model = self.model.cpu()
+
+            skip = []
             for i, (layer_index, filter_index) in enumerate(prune_targets):
                 print('[{}] - Pruning layer {} and filter_index {}'.format(i,layer_index,filter_index))
+                if i in skip or filter_index < 0:
+                    print('skipped pruning layer ', i)
+                    continue
+
                 model, update_pruned_layers = prune_xception_layer(model, layer_index, filter_index, self.prunner.flat_backbone, self.prunner.model_dict)
 
                 # fix filters' indices
                 for l, (l_index, f_index) in enumerate(prune_targets):
                     if l_index in update_pruned_layers and f_index >= filter_index:
+                        if f_index == filter_index:
+                            skip.append(l_index)
                         prune_targets[l] = (l_index, f_index-1)
 
 
@@ -590,11 +607,11 @@ class PrunningFineTuner_DEEPLAB:
             print("Filters prunned", str(message))
             print("Fine tuning to recover from prunning iteration.")
             optimizer = optim.SGD(self.model.parameters(), lr=0.0001, momentum=0.9)
-            time_per_epoch = self.train(optimizer, epoches=5)
-            epoch_times.append(time_per_epoch)
+            m_time, Acc, Acc_class, mIoU, FWIoU = self.train(optimizer, epoches=10)
+            epoch_times.append(m_time)
             # self.test()
 
-            torch.save(self.model, "/home/ido/Deep/Pytorch/pytorch-deeplab-xception/pruned_models/iter_{}_time_{}.pth".format(n,time_per_epoch))
+            torch.save(self.model, "/home/ido/Deep/Pytorch/pytorch-deeplab-xception/pruned_models/iter:{0}_time:{1:.2f}_Acc:{2:.3f}_Acc_class:{3:.3f}_mIoU:{4:.3f}_fwIoU:{5:.3f}.pth".format(n+221,m_time*1000,Acc*100, Acc_class*100, mIoU*100, FWIoU*100))
 
         print(epoch_times)
         print("Finished. Going to fine tune the model a bit more")
@@ -691,12 +708,13 @@ def main():
     if args.resume is not None:
         if not os.path.isfile(args.resume):
             raise RuntimeError("=> no checkpoint found at '{}'".format(args.resume))
-        checkpoint = torch.load(args.resume)
-        args.start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        best_pred = checkpoint['best_pred']
-        print("=> loaded checkpoint '{}' (epoch {})"
-              .format(args.resume, checkpoint['epoch']))
+        # checkpoint = torch.load(args.resume)
+        model = torch.load(args.resume)
+        # args.start_epoch = checkpoint['epoch']
+        # model.load_state_dict(checkpoint['state_dict'])
+        # best_pred = checkpoint['best_pred']
+        # print("=> loaded checkpoint '{}' (epoch {})"
+        #       .format(args.resume, checkpoint['epoch']))
 
     else:
         print('must supply a trained model.')

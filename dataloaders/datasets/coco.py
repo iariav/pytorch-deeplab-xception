@@ -37,13 +37,13 @@ class COCOSegmentation(Dataset):
         self.args = args
 
     def __getitem__(self, index):
-        _img, _target = self._make_img_gt_point_pair(index)
-        sample = {'image': _img, 'label': _target}
-
-        if self.split == "train":
-            return self.transform_tr(sample)
-        elif self.split == 'val':
-            return self.transform_val(sample)
+            _img, _target = self._make_img_gt_point_pair(index)
+            sample = {'image': _img, 'label': _target}
+    
+            if self.split == "train":
+                return self.transform_tr(sample)
+            elif self.split == 'val':
+                return self.transform_val(sample)
 
     def _make_img_gt_point_pair(self, index):
         coco = self.coco
